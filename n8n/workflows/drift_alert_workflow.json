@@ -1,0 +1,442 @@
+{
+  "id": "driftAlertAgent1",
+  "name": "Model Drift Alert Agent",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Model drift alert agent\n1. **Schedule** fires (or click *Execute workflow*).\n2. **Config** holds the scenario and alert thresholds. Tune them here.\n3. **Run drift check** calls the drift-monitor service: it scores a new batch, logs it to Postgres and runs Evidently.\n4. If a threshold is crossed, **Ollama** writes a root-cause explanation.\n5. The **Slack** alert links to the Evidently HTML report and Grafana; the explanation is saved to Postgres.\n\nEnv used: `DRIFT_MONITOR_URL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `SLACK_WEBHOOK_URL`.",
+        "height": 320,
+        "width": 480,
+        "color": 5
+      },
+      "id": "e6f2dc2c-efac-4a7f-850b-303640dbbab8",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -440,
+        -380
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "480bc0ec-36db-4707-a733-a37bd0c9d43f",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -400,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "3ca27e1b-249d-49a5-b251-d6c163a22c55",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -400,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b3f3d41b-a59d-48ad-ac6b-9b57fbebbfaf",
+              "name": "scenario",
+              "value": "auto",
+              "type": "string"
+            },
+            {
+              "id": "ba9e282b-a4bc-4390-a0d0-4451a5e95637",
+              "name": "drift_share",
+              "value": 0.3,
+              "type": "number"
+            },
+            {
+              "id": "cde076bc-8732-4e57-b00a-7727ecb6f27c",
+              "name": "psi",
+              "value": 0.25,
+              "type": "number"
+            },
+            {
+              "id": "288a263b-f221-4063-a188-ee3f6fc774f0",
+              "name": "prediction_psi",
+              "value": 0.2,
+              "type": "number"
+            },
+            {
+              "id": "c8af948c-1fae-4baf-913b-5d34b43f6971",
+              "name": "accuracy_drop",
+              "value": 0.05,
+              "type": "number"
+            },
+            {
+              "id": "012555fb-48a2-4d92-8cf5-9a2d30dcf1c9",
+              "name": "recall_drop",
+              "value": 0.1,
+              "type": "number"
+            },
+            {
+              "id": "1a30ad72-3ce1-4bed-98a2-68990ae34a32",
+              "name": "missing_share",
+              "value": 0.05,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "80c63a27-9876-4b16-b637-53467e7f130a",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -160,
+        100
+      ],
+      "notes": "scenario: auto | none | calibration | population | data_quality",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DRIFT_MONITOR_URL || 'http://drift-monitor:8000' }}/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ scenario: $json.scenario, thresholds: { drift_share: $json.drift_share, psi: $json.psi, prediction_psi: $json.prediction_psi, accuracy_drop: $json.accuracy_drop, recall_drop: $json.recall_drop, missing_share: $json.missing_share } }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "28c15b3c-2e0e-4210-acdb-9c0caabbaf44",
+      "name": "Run drift check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        80,
+        100
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Simulate batch → score → log to Postgres → Evidently",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4696c7a5-8cc7-4f78-a445-11c893b342ce",
+              "leftValue": "={{ $json.alert.triggered }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f5a7a439-ed6e-4f4f-b1f5-ae21096aa202",
+      "name": "Drift above threshold?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the drift report into a prompt for the local LLM (Ollama).\n// report.simulation (the ground-truth scenario) is deliberately NOT sent: the LLM has to\n// infer the root cause from the metrics alone, exactly as it would in production.\nconst r = $input.first().json;\nconst dd = r.dataset_drift, pd = r.prediction_drift, td = r.target_drift;\nconst p = r.performance, dq = r.data_quality;\nconst pct = (v) => (v === null || v === undefined) ? 'n/a' : (v * 100).toFixed(1) + '%';\n\nconst top = r.top_drifted_features.map(f =>\n  `- ${f.feature}: PSI=${f.psi}, KL=${f.kl_div}, ${f.stattest}=${f.drift_score} (drifted=${f.drifted}), ` +\n  `mean ${f.ref_mean} -> ${f.cur_mean} (${f.mean_shift_pct}%), missing=${pct(f.cur_missing_share)}`\n).join('\\n');\nconst stable = r.feature_drift.filter(f => !f.drifted && (f.psi ?? 0) < 0.1).map(f => f.feature);\nconst missing = Object.entries(dq.columns_with_missing || {}).map(([k, v]) => `${k} ${pct(v)}`).join(', ') || 'none';\n\nconst system = `You are a senior ML reliability engineer on call for a production classification model.\nYou receive drift-monitoring metrics computed with Evidently AI and explain them to a busy team in Slack.\nRules:\n- Use only the numbers provided. Do not invent metrics.\n- Reason about WHICH features moved together and which stayed stable: a coordinated shift in one\n  measurement family suggests an instrument or measurement change; a broad shift together with a changed\n  label mix suggests a real population change; unit-like jumps (values ~100x off) or missing values\n  suggest a data-pipeline bug.\n- Say how confident you are.\n- Format for Slack mrkdwn (use *bold*, not **bold**; no headings, no tables). Max 170 words.\nStructure exactly:\n*What changed:* one or two sentences.\n*Most likely root cause:* one or two ranked hypotheses, each with the evidence.\n*Impact on the model:* one sentence.\n*Next steps:* three short bullets.`;\n\nconst user = `Model: ${r.model.name} (${r.model.algorithm}), version ${r.model.version}.\nTask: predicts whether a breast-mass biopsy is malignant (1) or benign (0).\nInputs: 30 numeric features computed from a digitised biopsy image. Ten measurements (radius, texture,\nperimeter, area, smoothness, compactness, concavity, concave points, symmetry, fractal dimension), each as\n\"mean\", \"error\" (standard error) and \"worst\" (mean of the three largest values).\n\nMonitoring window: ${r.data.n_current} recent predictions vs. a reference set of ${r.data.n_reference}.\nAlert severity: ${r.alert.severity}. Thresholds crossed:\n${r.alert.reasons.map(x => '- ' + x).join('\\n')}\n\nDataset-level drift:\n- Drifted features (statistical test): ${dd.n_drifted}/${dd.n_features} (${pct(dd.share_drifted)})\n- Max PSI: ${dd.max_psi} on \"${dd.max_psi_feature}\"; mean PSI: ${dd.mean_psi}\n- Missing values in current batch: ${missing}\n- Target drift (actual malignant rate): ${pct(td.ref_positive_rate)} -> ${pct(td.cur_positive_rate)} (p=${td.p_value}, drifted=${td.detected})\n- Prediction drift (predicted malignant rate): ${pct(pd.ref_positive_rate)} -> ${pct(pd.cur_positive_rate)} (PSI=${pd.psi}, drifted=${pd.detected})\n\nModel performance (reference -> current):\n- Accuracy ${pct(p.reference.accuracy)} -> ${pct(p.current.accuracy)}; Precision ${p.reference.precision} -> ${p.current.precision}; Recall ${p.reference.recall} -> ${p.current.recall}; ROC AUC ${p.reference.roc_auc} -> ${p.current.roc_auc}\n\nTop features by PSI:\n${top}\n\nStable features (no drift, PSI < 0.1): ${stable.length ? stable.join(', ') : 'none'}\n\nExplain the most likely root cause.`;\n\nconst model = $env.OLLAMA_MODEL || 'llama3.1';\nreturn [{\n  json: {\n    run: r,\n    ollama_request: {\n      model,\n      stream: false,\n      // Reasoning models (qwen3, deepseek-r1, ...) would otherwise spend the budget \"thinking\".\n      ...(/qwen3|deepseek-r1|gpt-oss|magistral/i.test(model) ? { think: false } : {}),\n      options: { temperature: 0.2, num_predict: 450, num_ctx: 4096 },\n      messages: [\n        { role: 'system', content: system },\n        { role: 'user', content: user },\n      ],\n    },\n  },\n}];"
+      },
+      "id": "904ec378-1ea6-43fd-9bfd-3d1bafbecb46",
+      "name": "Build root-cause prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434' }}/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.ollama_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "6cc267d7-015e-4df5-bd86-0ffc027e3215",
+      "name": "Ollama: explain drift",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        -100
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Local LLM. The first call can take a minute while the model loads.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds the Slack Block Kit message from the drift report + the LLM explanation.\nconst run = $('Build root-cause prompt').first().json.run;\nconst llm = $input.first().json;\nconst model = $env.OLLAMA_MODEL || 'llama3.1';\n\nlet summary = (llm?.message?.content || llm?.response || '').replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim();\nconst llmOk = summary.length > 0;\nif (llmOk) {\n  summary = summary.replace(/\\*\\*(.+?)\\*\\*/g, '*$1*').replace(/^#+\\s*(.+)$/gm, '*$1*');\n} else {\n  const err = llm?.error?.message || llm?.error || 'no response';\n  summary = `_Root-cause summary unavailable: Ollama error (${String(err).slice(0, 200)}). ` +\n            `Check that Ollama is running and \"${model}\" is pulled._`;\n}\nconst clip = (t, n) => t.length > n ? t.slice(0, n - 1) + '…' : t;\n\nconst dd = run.dataset_drift, p = run.performance, a = run.alert;\nconst pct = (v) => (v === null || v === undefined) ? 'n/a' : (v * 100).toFixed(1) + '%';\nconst icon = a.severity === 'critical' ? ':rotating_light:' : ':warning:';\nconst top = run.top_drifted_features.slice(0, 5)\n  .map(f => `• \\`${f.feature}\\`  PSI ${f.psi}  ·  mean ${f.mean_shift_pct > 0 ? '+' : ''}${f.mean_shift_pct}%` +\n            (f.cur_missing_share ? `  ·  ${pct(f.cur_missing_share)} missing` : ''))\n  .join('\\n');\nconst grafanaUrl = ($env.GRAFANA_PUBLIC_URL || 'http://localhost:3000') + '/d/drift-overview';\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: `${a.severity === 'critical' ? '🚨' : '⚠️'} Model drift alert: ${a.severity.toUpperCase()}`, emoji: true } },\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: `*Model*\\n${run.model.name}\\n\\`${run.model.version}\\`` },\n    { type: 'mrkdwn', text: `*Drifted features*\\n${dd.n_drifted}/${dd.n_features} (${pct(dd.share_drifted)})` },\n    { type: 'mrkdwn', text: `*Max PSI*\\n${dd.max_psi} on \\`${dd.max_psi_feature}\\`` },\n    { type: 'mrkdwn', text: `*Accuracy*\\n${pct(p.reference.accuracy)} → ${pct(p.current.accuracy)}` },\n  ] },\n  { type: 'section', text: { type: 'mrkdwn', text: clip(`${icon} *Why it fired*\\n` + a.reasons.map(x => '• ' + x).join('\\n'), 2900) } },\n  { type: 'divider' },\n  { type: 'section', text: { type: 'mrkdwn', text: clip(`:robot_face: *Root-cause analysis* (${model}, running locally)\\n${summary}`, 2900) } },\n  { type: 'section', text: { type: 'mrkdwn', text: clip(`*Top drifting features*\\n${top}`, 2900) } },\n  { type: 'actions', elements: [\n    { type: 'button', text: { type: 'plain_text', text: 'Open Evidently report' }, url: run.report_url, style: 'primary' },\n    { type: 'button', text: { type: 'plain_text', text: 'Grafana dashboard' }, url: grafanaUrl },\n  ] },\n  { type: 'context', elements: [\n    { type: 'mrkdwn', text: `Run \\`${run.run_id}\\` · ${run.data.n_current} predictions vs ${run.data.n_reference} reference · links open on the machine running the stack` },\n  ] },\n];\n\nreturn [{\n  json: {\n    run_id: run.run_id,\n    llm_ok: llmOk,\n    llm_model: model,\n    llm_summary: summary,\n    slack: { text: `${a.severity.toUpperCase()} model drift alert: ${a.reasons.join('; ')}`, blocks },\n  },\n}];"
+      },
+      "id": "5610872c-0256-4fe3-a766-6c1abd8ff829",
+      "name": "Format Slack alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a23b2c2c-9141-4d41-8a86-31724bc058c8",
+      "name": "Send Slack alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        -100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DRIFT_MONITOR_URL || 'http://drift-monitor:8000' }}/runs/{{ $('Format Slack alert').first().json.run_id }}/summary",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ summary: $('Format Slack alert').first().json.llm_summary, llm_model: $('Format Slack alert').first().json.llm_ok ? $('Format Slack alert').first().json.llm_model : null, slack_notified: !$json.error }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "46edb232-9f0f-4ebb-93e3-8671febca247",
+      "name": "Save summary to Postgres",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1520,
+        -100
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Audit trail: explanation + whether Slack accepted it",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "4cb46ad1-4049-4106-81f3-075ea4e71785",
+      "name": "No drift: all clear",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        560,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The drift-monitor call itself failed: alert on the pipeline, not on the model.\nconst item = $input.first().json;\nconst msg = item?.error?.message || item?.message || JSON.stringify(item).slice(0, 500);\nreturn [{\n  json: {\n    slack: {\n      text: `Drift monitor pipeline failed: ${msg}`,\n      blocks: [\n        { type: 'header', text: { type: 'plain_text', text: '🛠️ Drift monitor pipeline failed', emoji: true } },\n        { type: 'section', text: { type: 'mrkdwn', text: `The scheduled monitoring run could not complete, so drift was *not* checked.\\n\\`\\`\\`${String(msg).slice(0, 2500)}\\`\\`\\`` } },\n        { type: 'context', elements: [{ type: 'mrkdwn', text: 'Check `docker compose logs drift-monitor` and the n8n execution log.' }] },\n      ],\n    },\n  },\n}];"
+      },
+      "id": "bf93da75-c12b-4b92-9ba1-8bcb97b84fe7",
+      "name": "Format failure alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "77de25ea-11e9-4ff2-90c2-e217c993a552",
+      "name": "Send failure to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        560,
+        340
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Run drift check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run drift check": {
+      "main": [
+        [
+          {
+            "node": "Drift above threshold?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format failure alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drift above threshold?": {
+      "main": [
+        [
+          {
+            "node": "Build root-cause prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No drift: all clear",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build root-cause prompt": {
+      "main": [
+        [
+          {
+            "node": "Ollama: explain drift",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama: explain drift": {
+      "main": [
+        [
+          {
+            "node": "Format Slack alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slack alert": {
+      "main": [
+        [
+          {
+            "node": "Send Slack alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack alert": {
+      "main": [
+        [
+          {
+            "node": "Save summary to Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format failure alert": {
+      "main": [
+        [
+          {
+            "node": "Send failure to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": []
+}

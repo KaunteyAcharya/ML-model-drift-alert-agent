@@ -1,0 +1,7 @@
+.env
+reports/*
+!reports/.gitkeep
+monitor/artifacts/
+__pycache__/
+*.pyc
+.venv/
