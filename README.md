@@ -1,5 +1,7 @@
 # Model Monitoring + Drift Alert Agent
 
+https://github.com/user-attachments/assets/671216f6-3152-46a9-874f-75e9d7f78147
+
 A local, fully open-source MLOps monitoring stack. A scheduled n8n workflow scores a new batch of
 "production" traffic, logs every prediction to Postgres, measures data/prediction/target drift and model
 quality with **Evidently AI**, and when a threshold is crossed asks a **local LLM (Ollama)** to explain
